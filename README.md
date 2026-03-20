@@ -1,121 +1,177 @@
-# PPA Pricing System v2
+﻿# PPA Pricing Framework
 
-这是一个针对日本电力市场（JEPX）的 PPA（购电协议）定价与预测系统。该系统整合了多种预测模型（Prophet, XGBoost, SARIMAX, 历史平均），提供统一的 CLI 命令行接口来执行定价、预测和市场分析任务。
+This repository contains a practical PPA pricing framework for the Japanese power market. The objective is not to claim perfect price forecasting, but to provide a complete, explainable, and reusable methodology that connects data, market assumptions, model outputs, validation, and pricing risk into one workflow.
 
-## 环境准备
+The current framework integrates four lines of work:
+- Statistical forecasting, with `SARIMAX` as the primary forecasting model
+- Fundamental pricing, based on Japan Merit Order LiveSheet inputs and plant-level monthly merit-order clearing
+- Market validation, using Tokyo monthly baseload forward history aligned with strict monthly OOS forecasts
+- Risk pricing, using strict OOS forecast errors to generate pricing ranges, contract-level PnL, VaR / ES, and no-loss quote ladders
 
-在使用本系统前，请确保已安装 Python 3.8+ 并安装相关依赖：
+Supporting documentation:
+- [Project Report](docs/PROJECT_REPORT.md)
+- [Project Guide](docs/PROJECT_GUIDE.md)
+
+## Current Conclusions
+
+The latest Tokyo conclusions are:
+- `SARIMAX` is the most suitable primary statistical pricing model in the current framework
+- `Market Forward` is closer to realized `actual spot` than strict monthly OOS `SARIMAX`, and should be treated as a market anchor
+- `Fundamental` raw prices provide a structural anchor; residual-calibrated fundamental prices provide a comparable structural fair value
+- Final pricing should not stop at a single point estimate; the framework now produces empirical pricing ranges, seller-side risk metrics, and no-loss quote levels
+
+## Environment Setup
+
+Recommended Python version: `3.10+`
 
 ```bash
 pip install -r requirements.txt
 ```
 
-*注意：如果还没有 `requirements.txt`，请确保安装 pandas, numpy, matplotlib, prophet, xgboost, statsmodels, scikit-learn 等核心库。*
+If `jpholiday` is not available locally, the code falls back gracefully and does not block the main workflow.
 
-## 命令行使用说明
+## Repository Structure
 
-系统的统一入口是 `src.cli.main` 模块。请在项目根目录下运行以下命令。
-
-**基本语法：**
-
-```bash
-python -m src.cli.main <command> [options]
+```text
+src/
+  cli/
+    commands/
+      pricing.py
+      forecast.py
+      analysis.py
+  core/
+    pricing/
+      ppa_pricing_engine.py
+      sarimax_risk_pricing.py
+  data/
+    loaders/
+      live_sheet_loader.py
+      mosaic_forward_loader.py
+  forecasting/
+    core.py
+    grid_search.py
+    training/
+    evaluation/
+  models/
+    ml_enhanced_v3/
+      sarimax_model.py
+      prophet_model.py
+      xgboost_model.py
+    fundamental_v2/
+      monthly_fundamental.py
+      calibration.py
+  visualization/
+    fundamental_analysis.py
+    model_comparison.py
+data/
+results/
+docs/
 ```
 
-可用命令 (`<command>`)：
-- `pricing`: 执行完整的 PPA 定价流程（训练 -> 验证 -> 定价计算）。
-- `forecast`: 执行中期电价预测与回测评估。
-- `analysis`: 运行市场数据分析（如基本面分析）。
+## Data Inputs
 
----
+The framework currently relies on three core data groups:
 
-### 1. PPA 定价 (Pricing)
+1. JEPX historical spot data
+- Used for SARIMAX / Prophet / XGBoost training and OOS validation
 
-`pricing` 命令用于计算特定合同期内的固定电价（Fixed Price）。它会自动进行滚动窗口训练、模型验证，并根据预测结果计算不同供电场景下的 PPA 价格。
+2. Japan Merit Order LiveSheet
+- Used to extract `plant master`, `monthly demand`, `availability`, and `generation cost`
+- Used to build the monthly fundamental merit-order clearing logic
 
-**常用参数：**
-- `--region`: 目标区域 (tokyo, kansai, etc.)，默认 `tokyo`。
-- `--models`: 使用的模型列表，可选 `xgboost`, `prophet`, `sarimax`, `historical`。默认使用 historical 和 sarimax。
-- `--contract-start`: 合同开始日期 (YYYY-MM-DD)，默认 `2027-04-01`。
-- `--contract-end`: 合同结束日期 (YYYY-MM-DD)，默认 `2028-03-31`。
-- `--volume`: 总签约电量 (MWh)，默认 `2.0`。
-- `--train-years`: 训练数据使用的年数，默认 `3`。
-- `--skip-validation`: 跳过验证步骤，仅计算价格。
+3. Mosaic monthly forward curve
+- Alias: `JAPAN-BASE-POWER-MONTH-TOKYO-FOBM`
+- Used for strict monthly OOS market-forward validation
 
-**运行示例：**
+## Main Commands
 
-1.  **基础运行（使用默认参数）**：
-    ```bash
-    python -m src.cli.main pricing
-    ```
-
-2.  **指定区域和合同期**：
-    计算关西电力（Kansai）2025年度的 PPA 价格：
-    ```bash
-    python -m src.cli.main pricing --region kansai --contract-start 2025-04-01 --contract-end 2026-03-31
-    ```
-
-3.  **使用高级模型（XGBoost 和 Prophet）**：
-    *注意：XGBoost 和 Prophet 计算时间较长。*
-    ```bash
-    python -m src.cli.main pricing --models xgboost prophet --region tokyo
-    ```
-
-4.  **自定义电量和训练窗口**：
-    ```bash
-    python -m src.cli.main pricing --volume 1000 --train-years 5
-    ```
-
----
-
-### 2. 电价预测与回测 (Forecast)
-
-`forecast` 命令专注于模型性能评估和中期预测。它会执行滚动回测（Rolling Backtest）来评估模型在不同时间段的表现。
-
-**常用参数：**
-- `--region`: 目标区域，默认 `tokyo`。
-- `--forecast-days`: 预测展望期（天数），默认 `90`。
-- `--years`: 训练数据年数，默认 `3`。
-- `--step-days`: 回测滑动的步长（天数），默认 `30`。
-- `--skip-prophet`: 跳过 Prophet 模型（以加快运行速度）。
-
-**运行示例：**
-
-1.  **运行 90 天预测回测**：
-    ```bash
-    python -m src.cli.main forecast --forecast-days 90
-    ```
-
-2.  **快速回测（跳过 Prophet）**：
-    ```bash
-    python -m src.cli.main forecast --skip-prophet
-    ```
-
----
-
-### 3. 数据分析 (Analysis)
-
-`analysis` 命令用于生成市场分析报告。
-
-**示例：**
+### 1. Forecast
 
 ```bash
-python -m src.cli.main analysis --type fundamental --region kansai
+python -m src.cli.main forecast --region tokyo --forecast-days 90
 ```
 
----
+Use this command to:
+- run rolling backtests across forecasting models
+- generate `monthly_comparison`, `model_comparison`, and `price_forecast`
 
-## 输出结果
+### 2. Fundamental Analysis
 
-所有运行结果默认保存在 `results/` 目录下，包含：
-- 预测数据 CSV
-- 模型评估报告
-- PPA 定价结果日志
+```bash
+python -m src.cli.main analysis --region tokyo --output-dir results --standardized-data-dir data/processed/fundamental
+```
 
-## 常见问题
+Use this command to:
+- standardize LiveSheet inputs
+- generate raw / calibrated monthly fundamental prices
+- produce validation charts and reports against SARIMAX, market forward, and actual spot
 
-**Q: 找不到模块 `src`？**
-A: 请确保你在项目的根目录下运行命令（即 `src` 文件夹所在的上一级目录）。
+### 3. Pricing
 
-**Q: 数据从哪里加载？**
-A: 默认从 `data/` 目录加载 `spot_summary_*.csv` 文件。请确保该目录下有 JEPX 的历史数据文件。
+Standard run:
+
+```bash
+python -m src.cli.main pricing --region tokyo --models sarimax historical --forecast-months 3 --volume 2 --output-dir results
+```
+
+If reusing an existing forecast file:
+
+```bash
+python -m src.cli.main pricing --region tokyo --external-forecast-file results\\price_forecast_tokyo_20260305_111746.csv --forecast-months 3 --volume 2 --output-dir results --skip-validation
+```
+
+Use this command to:
+- generate PPA point pricing
+- output model comparison results
+- produce SARIMAX risk ranges, contract bootstrap risk metrics, and quote ladders
+
+## Key Outputs
+
+Important output files include:
+
+Forecasting:
+- `results/model_comparison_tokyo_20260305_111746.csv`
+- `results/price_forecast_tokyo_20260305_111746.csv`
+
+Fundamental:
+- `results/fundamental_analysis_tokyo_20260320_110335.txt`
+- `results/fundamental_vs_sarimax_oos_tokyo_20260320_110335.png`
+- `results/strict_forward_validation_tokyo_20260320_110335.png`
+
+SARIMAX risk pricing:
+- `results/sarimax_risk_report_tokyo_20260320_142836.txt`
+- `results/sarimax_contract_risk_tokyo_20260320_142836.csv`
+- `results/sarimax_quote_bands_tokyo_20260320_142836.png`
+- `results/sarimax_pnl_distribution_tokyo_20260320_142836.png`
+
+## Latest Tokyo Snapshot
+
+Latest Tokyo metrics:
+- Fundamental raw MAE: `6.893 JPY/kWh`
+- Fundamental calibrated MAE: `0.732 JPY/kWh`
+- SARIMAX OOS MAE vs actual: `0.902 JPY/kWh`
+- Fundamental OOS MAE vs actual: `1.041 JPY/kWh`
+- Market Forward MAE vs actual: `0.820 JPY/kWh`
+- SARIMAX strict OOS MAE vs actual: `1.864 JPY/kWh`
+
+Three-month SARIMAX contract pricing metrics:
+- Point quote / fair value: `13.127 JPY/kWh`
+- Risk-neutral quote: `14.068 JPY/kWh`
+- 90% no-loss quote: `16.224 JPY/kWh`
+- Expected PnL at point quote: `-0.951 JPY/kWh`
+- 95% VaR loss: `2.802 JPY/kWh`
+- 95% ES loss: `3.170 JPY/kWh`
+
+## Recommended Usage
+
+The current business interpretation is:
+- `Market Forward` as market anchor and sanity check
+- `Fundamental` as structural explanation layer
+- `SARIMAX` as the primary pricing engine
+- strict OOS error history as the basis for risk-neutral and no-loss quote construction
+
+## Notes
+
+- This repository is intended as a releaseable pricing framework and a reusable internal knowledge base
+- The framework is complete enough for management reporting and further deployment in a shared git repository
+- Future work should focus on seasonal / regime segmentation, historical snapshot fundamental construction, and pricing policy refinement
